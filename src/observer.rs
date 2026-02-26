@@ -194,45 +194,50 @@ impl Observer {
     fn reset_notification(&mut self, request: &CoapRequest<SocketAddr>) {
         let message_id = request.message.header.message_id;
 
-        // the reset message does not contain a token, so we must use the message id
-        // to find the corresponding observer.
-        if let Some(unack_item) = self.unacknowledge_messages.remove(&message_id) {
-            let register_resource_key = &unack_item.register_resource;
-
-            // Clear the unacknowledged message ID here to prevent `remove_register_resource`
-            // from attempting to remove it again.
-            if let Some(item) = self.register_resources.get_mut(register_resource_key) {
-                item.unacknowledge_message = None;
-            }
-
-            // retrieve the details needed to remove the registration.
-            let (address, resource_path, token) = {
-                if let Some(item) = self.register_resources.get(register_resource_key) {
-                    (
-                        item.registered_responder.address(),
-                        item.resource.clone(),
-                        item.token.clone(),
-                    )
-                } else {
-                    // this case should ideally not happen if data structures are consistent.
-                    warn!(
-                        "Reset received for unknown registration key: {}",
-                        register_resource_key
-                    );
-                    return;
-                }
-            };
-
-            debug!(
-                "Reset received from {} for resource {}, removing observer",
-                address, resource_path
-            );
-
-            self.remove_register_resource(&address, &resource_path, &token);
-        } else {
-            // reset for an unknown message id, possibly a duplicate or late arrival.
+        // Validate Message ID
+        let Some(unack_item) = self.unacknowledge_messages.get(&message_id) else {
             debug!("Reset received for unknown Message ID: {}", message_id);
+            return;
+        };
+
+        // Verify source endpoint
+        let key = &unack_item.register_resource;
+        let Some(reg_item) = self.register_resources.get(key) else {
+            debug!("Reset received for unknown registration key: {}", key);
+            return;
+        };
+
+        let expected_address = reg_item.registered_responder.address();
+        if request.source != Some(expected_address) {
+            warn!(
+                "Received RST for MID {} from unexpected source {:?}, expected {}. Ignoring.",
+                message_id, request.source, expected_address
+            );
+            return;
         }
+
+        // Extract necessary information for cleanup
+        // We clone data here to release the immutable borrows on self before mutation.
+        let address = expected_address;
+        let resource_path = reg_item.resource.clone();
+        let token = reg_item.token.clone();
+        let register_resource_key = key.clone();
+
+        // Remove the mapping between MID and resource
+        self.unacknowledge_messages.remove(&message_id);
+
+        // Clear the pending message reference in the registration to avoid double-deletion
+        if let Some(item) = self.register_resources.get_mut(&register_resource_key) {
+            item.unacknowledge_message = None;
+        }
+
+        debug!(
+            "Reset received from {} for resource {}, removing observer",
+            address, resource_path
+        );
+
+        // Remove the observer from the registry
+        self.remove_register_resource(&address, &resource_path, &token);
     }
 
     async fn resource_changed(&mut self, request: &CoapRequest<SocketAddr>) {
