@@ -1,4 +1,7 @@
-use std::{net::{IpAddr, SocketAddr}, str::FromStr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+};
 
 pub use coap_lite::{
     CoapOption, CoapRequest, MessageClass, MessageType, ObserveOption, Packet,

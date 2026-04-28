@@ -42,6 +42,11 @@ pub struct Packet {
 }
 
 #[derive(Debug)]
+/// Represents control messages for an observation relationship.
+///
+/// Note: Cancellation via `Terminate` is inherently best-effort over UDP.
+/// If the deregistration message is lost, the server may continue sending notifications.
+/// Client code should be prepared to ignore unexpected messages after calling `send(Terminate)`.
 pub enum ObserveMessage {
     Terminate,
 }
@@ -834,8 +839,11 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
             Ok(response) => {
                 if let Some(block2) = CoAPClient::<T>::get_block2_option(&response.message) {
                     if CoAPClient::<T>::contains_more_blocks(&response.message) {
-                        // Start of a new blockwise transfer.
-                        // Receive the rest before passing it on to the user-defined handler.
+                        let expected_etag: Option<Vec<u8>> = response
+                            .message
+                            .get_option(CoapOption::ETag)
+                            .and_then(|iter| iter.front().cloned());
+
                         request.response = Some(CoapResponse {
                             message: response.message.clone(),
                         });
@@ -853,19 +861,17 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
                             .message
                             .add_option_as::<BlockValue>(CoapOption::Block2, next_block2);
 
-                        let full_datagram = self.receive(request).await;
-                        // Pass the message on to the user-defined handler
+                        let full_datagram = self
+                            .receive_with_etag_validation(request, expected_etag.as_deref())
+                            .await;
+
                         if let Ok(full_datagram) = full_datagram {
                             handler(full_datagram.message.clone());
                         }
                     } else {
-                        // A full datagram has been received
-                        // Pass the message on to the user-defined handler
                         handler(response.message);
                     }
                 } else {
-                    // A full datagram has been received
-                    // Pass the message on to the user-defined handler
                     handler(response.message);
                 }
             }
@@ -958,6 +964,57 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
     async fn receive(&self, request: &mut CoapRequest<SocketAddr>) -> IoResult<CoapResponse> {
         let mut block2_state = BlockState::default();
         loop {
+            match Self::intercept_response(request, &mut block2_state) {
+                Ok(true) => {
+                    request.message.header.message_id = self.gen_message_id();
+                    let resp = self.send_single_request(request).await?;
+                    request.response = Some(resp);
+                }
+                Err(err) => {
+                    error!("intercept response error: {:?}", err);
+                    return Err(Error::new(ErrorKind::Interrupted, "packet error"));
+                }
+                Ok(false) => {
+                    break;
+                }
+            }
+        }
+        Ok(CoapResponse {
+            message: request.response.as_ref().unwrap().message.clone(),
+        })
+    }
+
+    /// Receive a response supporting block-wise with ETag validation.
+    ///
+    /// Returns `std::io::Error` with `ErrorKind::InvalidData` if the message contains
+    /// an ETag mismatch. This indicates the resource changed during the block transfer,
+    /// and the client MUST abort the current transfer and wait for the next notification.
+    /// Users should check `e.to_string().contains("ETag mismatch")` to handle this gracefully.
+    async fn receive_with_etag_validation(
+        &self,
+        request: &mut CoapRequest<SocketAddr>,
+        expected_etag: Option<&[u8]>,
+    ) -> IoResult<CoapResponse> {
+        let mut block2_state = BlockState::default();
+        loop {
+            if let Some(expected) = expected_etag {
+                if let Some(ref response) = request.response {
+                    let etag_matches = response
+                        .message
+                        .get_option(CoapOption::ETag)
+                        .and_then(|iter| iter.front())
+                        .map(|etag: &Vec<u8>| etag.as_slice() == expected)
+                        .unwrap_or(false);
+
+                    if !etag_matches {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "ETag mismatch: resource changed during block transfer",
+                        ));
+                    }
+                }
+            }
+
             match Self::intercept_response(request, &mut block2_state) {
                 Ok(true) => {
                     request.message.header.message_id = self.gen_message_id();
@@ -1856,5 +1913,198 @@ mod test {
                 .is_err(),
             "failed transport should make all other requests fail"
         )
+    }
+
+    fn generate_large_payload(byte: u8) -> Vec<u8> {
+        let payload = vec![byte; 2048];
+        assert!(
+            payload.len() > 1024,
+            "Test payload must be larger than default block size"
+        );
+        payload
+    }
+
+    async fn large_resource_handler(
+        mut req: Box<CoapRequest<SocketAddr>>,
+    ) -> Box<CoapRequest<SocketAddr>> {
+        if req.response.is_none() {
+            req.response = Some(CoapResponse {
+                message: Message::new(),
+            });
+        }
+
+        if let Some(ref mut response) = req.response {
+            response.message.payload = b"OK".to_vec();
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn test_observe_large_resource_continuous_update() {
+        let server_port = server::test::spawn_server("127.0.0.1:0", large_resource_handler)
+            .recv()
+            .await
+            .unwrap();
+        let addr = format!("127.0.0.1:{}", server_port);
+        let client = UdpCoAPClient::new(&addr).await.unwrap();
+
+        let payload_a = generate_large_payload(b'a');
+        let put_req = RequestBuilder::new("/large", Method::Put)
+            .data(Some(payload_a.clone()))
+            .build();
+        client.send(put_req).await.unwrap();
+
+        let received_payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_payloads_clone = received_payloads.clone();
+
+        let mut observe_req = CoapRequest::new();
+        observe_req.set_method(Method::Get);
+        observe_req.set_path("/large");
+        observe_req.message.add_option_as::<BlockValue>(
+            CoapOption::Block2,
+            BlockValue::new(0, false, 1024).unwrap(),
+        );
+
+        let unsubscriber = client
+            .observe_with(observe_req, move |msg| {
+                let mut lock = received_payloads_clone.lock().unwrap();
+                lock.push(msg.payload.clone());
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let first_payloads = received_payloads.lock().unwrap().clone();
+        assert_eq!(
+            first_payloads.len(),
+            1,
+            "Should receive initial notification"
+        );
+        assert_eq!(first_payloads[0], payload_a, "Initial payload mismatch");
+
+        let payload_b = generate_large_payload(b'b');
+        let put_req2 = RequestBuilder::new("/large", Method::Put)
+            .data(Some(payload_b.clone()))
+            .build();
+        client.send(put_req2).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let second_payloads = received_payloads.lock().unwrap().clone();
+        assert_eq!(
+            second_payloads.len(),
+            2,
+            "Should receive update notification"
+        );
+        assert_eq!(second_payloads[1], payload_b, "Updated payload mismatch");
+
+        let _ = unsubscriber.send(ObserveMessage::Terminate);
+    }
+
+    #[tokio::test]
+    async fn test_observe_cancel_stops_future_notifications() {
+        let server_port = server::test::spawn_server("127.0.0.1:0", large_resource_handler)
+            .recv()
+            .await
+            .unwrap();
+        let addr = format!("127.0.0.1:{}", server_port);
+        let client = UdpCoAPClient::new(&addr).await.unwrap();
+
+        // Use small payload to avoid exceeding client's 1500 byte UDP receive buffer
+        let payload_a = vec![b'a'; 100];
+        client
+            .send(
+                RequestBuilder::new("/large", Method::Put)
+                    .data(Some(payload_a.clone()))
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let handler_counter = Arc::new(AtomicU16::new(0));
+        let handler_counter_clone = handler_counter.clone();
+
+        let unsubscriber = client
+            .observe("/large", move |_msg| {
+                handler_counter_clone.fetch_add(1, Ordering::Relaxed);
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            handler_counter.load(Ordering::Relaxed),
+            1,
+            "Initial observe failed"
+        );
+
+        let _ = unsubscriber.send(ObserveMessage::Terminate);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let payload_b = vec![b'b'; 100];
+        client
+            .send(
+                RequestBuilder::new("/large", Method::Put)
+                    .data(Some(payload_b))
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            handler_counter.load(Ordering::Relaxed),
+            1,
+            "Should not receive notification after cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_observe_large_resource_no_block2_fallback() {
+        let server_port = server::test::spawn_server("127.0.0.1:0", large_resource_handler)
+            .recv()
+            .await
+            .unwrap();
+        let addr = format!("127.0.0.1:{}", server_port);
+        let client = UdpCoAPClient::new(&addr).await.unwrap();
+
+        // Use 1200 bytes: larger than 1024 block size, but smaller than 1500 UDP buffer limit
+        let payload = vec![b'x'; 1200];
+        client
+            .send(
+                RequestBuilder::new("/large", Method::Put)
+                    .data(Some(payload.clone()))
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let handler_received_full = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_received_full_clone = handler_received_full.clone();
+
+        // Construct registration request without Block2 option
+        let mut req = CoapRequest::new();
+        req.set_method(Method::Get);
+        req.set_path("/large");
+
+        let unsubscriber = client
+            .observe_with(req, move |msg| {
+                // Verify that even without Block2 and larger than default block size, full data is received at once
+                assert_eq!(msg.payload.len(), 1200);
+                assert_eq!(msg.payload, payload);
+                handler_received_full_clone.store(true, Ordering::Relaxed);
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            handler_received_full.load(Ordering::Relaxed),
+            "Fallback to full payload failed"
+        );
+
+        let _ = unsubscriber.send(ObserveMessage::Terminate);
     }
 }
