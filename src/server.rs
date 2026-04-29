@@ -18,7 +18,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::observer::Observer;
+use crate::observer::{encode_coap_uint, Observer};
 
 #[derive(Debug)]
 pub enum CoAPServerError {
@@ -348,6 +348,11 @@ impl ServerCoapState {
                     response.message.payload = payload.to_vec();
                     response.message.clear_option(CoapOption::ETag);
                     response.message.add_option(CoapOption::ETag, etag);
+                    // Prevent duplicate Size2 options, clear first.
+                    response.message.clear_option(CoapOption::Size2);
+                    response
+                        .message
+                        .add_option(CoapOption::Size2, encode_coap_uint(payload.len()));
                 }
             }
         }

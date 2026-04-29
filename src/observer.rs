@@ -56,6 +56,17 @@ struct UnacknowledgeMessageItem {
     try_times: usize,
 }
 
+/// Encodes a usize as a CoAP uint (big-endian, variable length up to 4 bytes).
+/// The value 0 is encoded as an empty byte slice. Values larger than 2^32-1 are saturated.
+pub(crate) fn encode_coap_uint(value: usize) -> Vec<u8> {
+    (value.min(u32::MAX as usize) as u32)
+        .to_be_bytes()
+        .iter()
+        .skip_while(|&&b| b == 0)
+        .copied()
+        .collect()
+}
+
 impl Observer {
     /// Creates an observer with channel to send message.
     pub fn new() -> Self {
@@ -205,6 +216,11 @@ impl Observer {
             response2
                 .message
                 .add_option(CoapOption::ETag, resource.etag.clone());
+
+            let total_size = resource.payload.len();
+            response2
+                .message
+                .add_option(CoapOption::Size2, encode_coap_uint(total_size));
 
             if let Some(block_size) = preferred_block_size {
                 if resource.payload.len() > block_size {
@@ -527,6 +543,9 @@ impl Observer {
         message.header.message_id = message_id;
         message.add_option(CoapOption::ETag, resource.etag.clone());
 
+        let total_size = resource.payload.len();
+        message.add_option(CoapOption::Size2, encode_coap_uint(total_size));
+
         if let Some(block_size) = register_resource.preferred_block_size {
             if resource.payload.len() > block_size {
                 let block = BlockValue::new(0, true, block_size).expect("valid block size");
@@ -586,6 +605,10 @@ mod test {
             _ => {}
         };
         return req;
+    }
+
+    fn decode_uint(data: &[u8]) -> usize {
+        data.iter().fold(0, |acc, &b| (acc << 8) | b as usize)
     }
 
     #[tokio::test]
@@ -854,7 +877,7 @@ mod test {
         // 1. Prepare a resource exactly equal to block_size (1024 bytes)
         let payload_exact = vec![0xAA; 1024];
         let mut put_req = CoapRequest::<SocketAddr>::new();
-        put_req.set_method(Method::Put); // Must be set to PUT
+        put_req.set_method(Method::Put);
         put_req.set_path(path);
         put_req.message.payload = payload_exact.clone();
         put_req.source = Some(addr1);
@@ -862,11 +885,11 @@ mod test {
             .request_handler(&mut put_req, Arc::new(MockResponder::new(addr1)))
             .await;
 
-        // 2. Simulate Client 1 registering, expecting block size 1024
+        // 2. Client 1 registers, expecting block size 1024
         let mut reg_req1 = CoapRequest::<SocketAddr>::new();
         reg_req1.set_method(Method::Get);
         reg_req1.set_path(path);
-        reg_req1.set_observe_flag(ObserveOption::Register); // Must set Observe flag
+        reg_req1.set_observe_flag(ObserveOption::Register);
         reg_req1.message.add_option_as::<BlockValue>(
             CoapOption::Block2,
             BlockValue::new(0, false, 1024).unwrap(),
@@ -874,7 +897,7 @@ mod test {
         reg_req1.source = Some(addr1);
         reg_req1.response = Some(CoapResponse {
             message: Packet::new(),
-        }); // Must initialize response
+        });
 
         let responder1 = Arc::new(MockResponder::new(addr1));
         observer
@@ -884,14 +907,22 @@ mod test {
         let resp1_bytes = responder1.get_last_sent().await.unwrap();
         let resp1_pkt = Packet::from_bytes(&resp1_bytes).unwrap();
 
-        // Assertion: payload equals block size, server should not add Block2
         assert_eq!(resp1_pkt.payload.len(), 1024);
         assert!(
             resp1_pkt.get_option(CoapOption::Block2).is_none(),
             "Should not add Block2 if exactly equal"
         );
 
-        // 3. Prepare a resource larger than block_size (1500 bytes)
+        // Size2 assertion for Client 1 registration
+        let size2_opt = resp1_pkt.get_first_option(CoapOption::Size2);
+        assert!(
+            size2_opt.is_some(),
+            "Size2 missing in register response (no block2)"
+        );
+        let size2_val = decode_uint(size2_opt.unwrap());
+        assert_eq!(size2_val, 1024, "Size2 value mismatch");
+
+        // 3. Prepare larger resource (1500 bytes)
         let payload_large = vec![0xBB; 1500];
         let mut put_req2 = CoapRequest::<SocketAddr>::new();
         put_req2.set_method(Method::Put);
@@ -902,7 +933,7 @@ mod test {
             .request_handler(&mut put_req2, Arc::new(MockResponder::new(addr1)))
             .await;
 
-        // 4. Simulate Client 2 registering, expecting smaller block size (512 bytes)
+        // 4. Client 2 registers, expecting block size 512
         let mut reg_req2 = CoapRequest::<SocketAddr>::new();
         reg_req2.set_method(Method::Get);
         reg_req2.set_path(path);
@@ -915,7 +946,7 @@ mod test {
         reg_req2.source = Some(addr2);
         reg_req2.response = Some(CoapResponse {
             message: Packet::new(),
-        }); // Must initialize response
+        });
 
         let responder2 = Arc::new(MockResponder::new(addr2));
         observer
@@ -925,7 +956,6 @@ mod test {
         let resp2_bytes = responder2.get_last_sent().await.unwrap();
         let resp2_pkt = Packet::from_bytes(&resp2_bytes).unwrap();
 
-        // Assertion: Client 2 receives first block, size matches its 512 preference
         assert_eq!(resp2_pkt.payload.len(), 512);
         let block2_opt = resp2_pkt
             .get_first_option_as::<BlockValue>(CoapOption::Block2)
@@ -934,7 +964,19 @@ mod test {
         assert_eq!(block2_opt.size(), 512);
         assert!(block2_opt.more, "Should have more blocks");
 
-        // 5. Verify Client 1's preference (1024) was not overwritten by Client 2 (512)
+        // Size2 assertion for Client 2 registration
+        let size2_opt2 = resp2_pkt.get_first_option(CoapOption::Size2);
+        assert!(
+            size2_opt2.is_some(),
+            "Size2 missing in register response with block2"
+        );
+        let size2_val2 = decode_uint(size2_opt2.unwrap());
+        assert_eq!(
+            size2_val2, 1500,
+            "Size2 value mismatch in block2 registration"
+        );
+
+        // 5. Trigger a resource change (PUT) to cause notification to Client 1
         let mut put_req3 = CoapRequest::<SocketAddr>::new();
         put_req3.set_method(Method::Put);
         put_req3.set_path(path);
@@ -947,12 +989,77 @@ mod test {
         let resp1_notify_bytes = responder1.get_last_sent().await.unwrap();
         let resp1_notify_pkt = Packet::from_bytes(&resp1_notify_bytes).unwrap();
 
-        // Assertion: Client 1's notification is still a 1024 byte block
         assert_eq!(resp1_notify_pkt.payload.len(), 1024);
         let notify_block2 = resp1_notify_pkt
             .get_first_option_as::<BlockValue>(CoapOption::Block2)
             .unwrap()
             .unwrap();
         assert_eq!(notify_block2.size(), 1024);
+
+        // Size2 assertion for notification
+        let size2_opt_notify = resp1_notify_pkt.get_first_option(CoapOption::Size2);
+        assert!(size2_opt_notify.is_some(), "Size2 missing in notification");
+        let size2_val_notify = decode_uint(size2_opt_notify.unwrap());
+        assert_eq!(
+            size2_val_notify, 1500,
+            "Size2 value mismatch in notification"
+        );
+    }
+
+    #[test]
+    fn test_encode_coap_uint() {
+        assert_eq!(encode_coap_uint(0), vec![]);
+        assert_eq!(encode_coap_uint(1), vec![0x01]);
+        assert_eq!(encode_coap_uint(255), vec![0xFF]);
+        assert_eq!(encode_coap_uint(256), vec![0x01, 0x00]);
+        assert_eq!(encode_coap_uint(0xFFFFFFFF), vec![0xFF, 0xFF, 0xFF, 0xFF]);
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(encode_coap_uint(0x100000000), vec![0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_observe_empty_resource_includes_size2() {
+        let mut observer = Observer::new();
+        let path = "empty";
+        let addr: SocketAddr = "127.0.0.1:5003".parse().unwrap();
+
+        // Create an empty resource via PUT
+        let empty_payload = vec![];
+        let mut put_req = CoapRequest::<SocketAddr>::new();
+        put_req.set_method(Method::Put);
+        put_req.set_path(path);
+        put_req.message.payload = empty_payload.clone();
+        put_req.source = Some(addr);
+        observer
+            .request_handler(&mut put_req, Arc::new(MockResponder::new(addr)))
+            .await;
+
+        // Register to observe the empty resource
+        let mut reg_req = CoapRequest::<SocketAddr>::new();
+        reg_req.set_method(Method::Get);
+        reg_req.set_path(path);
+        reg_req.set_observe_flag(ObserveOption::Register);
+        reg_req.source = Some(addr);
+        reg_req.response = Some(CoapResponse {
+            message: Packet::new(),
+        });
+        let responder = Arc::new(MockResponder::new(addr));
+        observer
+            .request_handler(&mut reg_req, responder.clone())
+            .await;
+
+        let resp_bytes = responder.get_last_sent().await.unwrap();
+        let resp_pkt = Packet::from_bytes(&resp_bytes).unwrap();
+
+        // Verify Size2 option is present and value is 0
+        let size2_opt = resp_pkt.get_first_option(CoapOption::Size2);
+        assert!(
+            size2_opt.is_some(),
+            "Size2 option missing for empty resource"
+        );
+        let size2_val = decode_uint(size2_opt.unwrap());
+        assert_eq!(size2_val, 0, "Size2 value should be 0 for empty payload");
     }
 }
