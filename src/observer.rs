@@ -352,13 +352,25 @@ impl Observer {
 
         self.register_resources
             .entry(register_resource_key.clone())
-            .or_insert(RegisterResourceItem {
+            .and_modify(|existing| {
+                // Clear any pending unacknowledged message to prevent stale timeout logic
+                if let Some(old_msg_id) = existing.unacknowledge_message.take() {
+                    self.unacknowledge_messages.remove(&old_msg_id);
+                }
+
+                // Refresh the observation state with new parameters
+                existing.registered_responder = register_key.clone();
+                existing.token = token.into();
+                existing.preferred_block_size = preferred_block_size;
+            })
+            .or_insert_with(|| RegisterResourceItem {
                 registered_responder: register_key.clone(),
                 resource: path.clone(),
                 token: token.into(),
                 unacknowledge_message: None,
                 preferred_block_size,
             });
+
         resource
             .register_resources
             .replace(register_resource_key.clone());
@@ -1061,5 +1073,95 @@ mod test {
         );
         let size2_val = decode_uint(size2_opt.unwrap());
         assert_eq!(size2_val, 0, "Size2 value should be 0 for empty payload");
+    }
+
+    #[tokio::test]
+    async fn test_observe_reregistration_updates_token_and_block_size() {
+        let mut observer = Observer::new();
+        let path = "test_update";
+        let addr: SocketAddr = "127.0.0.1:6001".parse().unwrap();
+
+        // Create a resource larger than block sizes to trigger block-wise transfer
+        let payload = vec![0xAA; 1500];
+        let mut put_req = CoapRequest::<SocketAddr>::new();
+        put_req.set_method(Method::Put);
+        put_req.set_path(path);
+        put_req.message.payload = payload.clone();
+        put_req.source = Some(addr);
+        observer
+            .request_handler(&mut put_req, Arc::new(MockResponder::new(addr)))
+            .await;
+
+        // Initial registration with Token A and Block2 preference 1024
+        let mut reg_req1 = CoapRequest::<SocketAddr>::new();
+        reg_req1.set_method(Method::Get);
+        reg_req1.set_path(path);
+        reg_req1.set_observe_flag(ObserveOption::Register);
+        reg_req1.message.set_token(vec![1]); // Token A
+        reg_req1.message.add_option_as::<BlockValue>(
+            CoapOption::Block2,
+            BlockValue::new(0, false, 1024).unwrap(),
+        );
+        reg_req1.source = Some(addr);
+        reg_req1.response = Some(CoapResponse {
+            message: Packet::new(),
+        });
+
+        let responder1 = Arc::new(MockResponder::new(addr));
+        observer
+            .request_handler(&mut reg_req1, responder1.clone())
+            .await;
+
+        // Re-registration from the same client with Token B and Block2 preference 512
+        let mut reg_req2 = CoapRequest::<SocketAddr>::new();
+        reg_req2.set_method(Method::Get);
+        reg_req2.set_path(path);
+        reg_req2.set_observe_flag(ObserveOption::Register);
+        reg_req2.message.set_token(vec![2]); // Token B
+        reg_req2.message.add_option_as::<BlockValue>(
+            CoapOption::Block2,
+            BlockValue::new(0, false, 512).unwrap(), // New preference
+        );
+        reg_req2.source = Some(addr);
+        reg_req2.response = Some(CoapResponse {
+            message: Packet::new(),
+        });
+
+        let responder2 = Arc::new(MockResponder::new(addr));
+        observer
+            .request_handler(&mut reg_req2, responder2.clone())
+            .await;
+
+        // Trigger a resource change to force a notification
+        let mut put_req2 = CoapRequest::<SocketAddr>::new();
+        put_req2.set_method(Method::Put);
+        put_req2.set_path(path);
+        put_req2.message.payload = vec![0xBB; 1500];
+        put_req2.source = Some(addr);
+        observer
+            .request_handler(&mut put_req2, responder2.clone())
+            .await;
+
+        // Fetch the notification sent by the observer
+        let resp_bytes = responder2.get_last_sent().await.unwrap();
+        let resp_pkt = Packet::from_bytes(&resp_bytes).unwrap();
+
+        // Verify the server used the updated state (Token B and Block size 512)
+        assert_eq!(
+            resp_pkt.get_token(),
+            vec![2],
+            "Server should use the updated token from re-registration"
+        );
+        assert_eq!(
+            resp_pkt.payload.len(),
+            512,
+            "Server should use the updated block size preference from re-registration"
+        );
+
+        let block2_opt = resp_pkt
+            .get_first_option_as::<BlockValue>(CoapOption::Block2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(block2_opt.size(), 512);
     }
 }

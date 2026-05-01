@@ -989,7 +989,7 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
     /// Returns `std::io::Error` with `ErrorKind::InvalidData` if the message contains
     /// an ETag mismatch. This indicates the resource changed during the block transfer,
     /// and the client MUST abort the current transfer and wait for the next notification.
-    /// Users should check `e.to_string().contains("ETag mismatch")` to handle this gracefully.
+    /// Callers should branch on `e.kind() == ErrorKind::InvalidData` to handle this gracefully.
     async fn receive_with_etag_validation(
         &self,
         request: &mut CoapRequest<SocketAddr>,
@@ -1007,6 +1007,11 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
                         .unwrap_or(false);
 
                     if !etag_matches {
+                        debug!(
+                            "ETag mismatch detected: expected {:?}, got {:?}. Aborting block transfer.",
+                            expected,
+                            response.message.get_option(CoapOption::ETag)
+                        );
                         return Err(Error::new(
                             ErrorKind::InvalidData,
                             "ETag mismatch: resource changed during block transfer",
