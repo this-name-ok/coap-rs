@@ -1,6 +1,6 @@
 use coap_lite::{
-    CoapRequest, MessageClass, MessageType, ObserveOption, Packet, RequestType as Method,
-    ResponseType as Status,
+    block_handler::BlockValue, CoapOption, CoapRequest, MessageClass, MessageType, ObserveOption,
+    Packet, RequestType as Method, ResponseType as Status,
 };
 use futures::{
     stream::{Fuse, SelectNextSome},
@@ -36,9 +36,10 @@ struct RegisterItem {
 
 #[derive(Debug)]
 struct ResourceItem {
-    payload: Vec<u8>,
+    payload: Arc<Vec<u8>>,
     register_resources: HashSet<String>,
     sequence: u32,
+    etag: Vec<u8>,
 }
 
 struct RegisterResourceItem {
@@ -46,12 +47,24 @@ struct RegisterResourceItem {
     pub(crate) resource: String,
     pub(crate) token: Vec<u8>,
     pub(crate) unacknowledge_message: Option<u16>,
+    pub(crate) preferred_block_size: Option<usize>,
 }
 
 #[derive(Debug)]
 struct UnacknowledgeMessageItem {
     register_resource: String,
     try_times: usize,
+}
+
+/// Encodes a usize as a CoAP uint (big-endian, variable length up to 4 bytes).
+/// The value 0 is encoded as an empty byte slice. Values larger than 2^32-1 are saturated.
+pub(crate) fn encode_coap_uint(value: usize) -> Vec<u8> {
+    (value.min(u32::MAX as usize) as u32)
+        .to_be_bytes()
+        .iter()
+        .skip_while(|&&b| b == 0)
+        .copied()
+        .collect()
 }
 
 impl Observer {
@@ -68,8 +81,33 @@ impl Observer {
     }
 
     /// poll the observer's timer.
-    pub fn select_next_some(&mut self) -> SelectNextSome<Fuse<IntervalStream>> {
+    pub fn select_next_some(&mut self) -> SelectNextSome<'_, Fuse<IntervalStream>> {
         self.timer.select_next_some()
+    }
+
+    /// Checks if the given client endpoint is currently observing the specified resource.
+    pub fn is_observing(&self, addr: &SocketAddr, path: &String) -> bool {
+        let key = Self::format_register_resource(addr, path);
+        self.register_resources.contains_key(&key)
+    }
+
+    /// Returns a shared reference to the resource payload and its current ETag.
+    /// Used by the server to serve remaining blocks consistently during a block-wise transfer.
+    pub fn get_resource_payload_and_etag(&self, path: &String) -> Option<(Arc<Vec<u8>>, Vec<u8>)> {
+        self.resources
+            .get(path)
+            .map(|r| (r.payload.clone(), r.etag.clone()))
+    }
+
+    /// Computes a non-cryptographic ETag using FNV-1a hash for change detection only.
+    /// This ETag is not suitable for security purposes (e.g., integrity validation against attackers).
+    fn compute_etag(payload: &[u8]) -> Vec<u8> {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &byte in payload {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash.to_be_bytes()[..4].to_vec()
     }
 
     /// filter the requests belong to the observer. store the responder in case it is needed
@@ -153,22 +191,51 @@ impl Observer {
             return;
         }
 
+        let preferred_block_size = request
+            .message
+            .get_first_option_as::<BlockValue>(CoapOption::Block2)
+            .and_then(|x: Result<BlockValue, _>| x.ok())
+            .map(|b: BlockValue| b.size());
+
         self.record_register_resource(
             responder.clone(),
             &resource_path,
             &request.message.get_token(),
+            preferred_block_size,
         );
 
         let resource = self.resources.get(&resource_path).unwrap();
 
         if let Some(response) = request.response.take() {
             let mut response2 = response.clone();
-            response2.message.payload = resource.payload.clone();
             response2.message.set_observe_value(resource.sequence);
             response2
                 .message
                 .header
                 .set_type(MessageType::NonConfirmable);
+            response2
+                .message
+                .add_option(CoapOption::ETag, resource.etag.clone());
+
+            let total_size = resource.payload.len();
+            response2
+                .message
+                .add_option(CoapOption::Size2, encode_coap_uint(total_size));
+
+            if let Some(block_size) = preferred_block_size {
+                if resource.payload.len() > block_size {
+                    let block = BlockValue::new(0, true, block_size).expect("valid block size");
+                    response2
+                        .message
+                        .add_option_as::<BlockValue>(CoapOption::Block2, block);
+                    response2.message.payload = resource.payload[..block_size].to_vec();
+                } else {
+                    response2.message.payload = resource.payload.to_vec();
+                }
+            } else {
+                response2.message.payload = resource.payload.to_vec();
+            }
+
             if let Ok(b) = response2.message.to_bytes() {
                 responder.respond(b).await;
             }
@@ -276,6 +343,7 @@ impl Observer {
         responder: Arc<dyn Responder>,
         path: &String,
         token: &[u8],
+        preferred_block_size: Option<usize>,
     ) {
         let resource = self.resources.get_mut(path).unwrap();
         let register_key = responder;
@@ -284,12 +352,25 @@ impl Observer {
 
         self.register_resources
             .entry(register_resource_key.clone())
-            .or_insert(RegisterResourceItem {
+            .and_modify(|existing| {
+                // Clear any pending unacknowledged message to prevent stale timeout logic
+                if let Some(old_msg_id) = existing.unacknowledge_message.take() {
+                    self.unacknowledge_messages.remove(&old_msg_id);
+                }
+
+                // Refresh the observation state with new parameters
+                existing.registered_responder = register_key.clone();
+                existing.token = token.into();
+                existing.preferred_block_size = preferred_block_size;
+            })
+            .or_insert_with(|| RegisterResourceItem {
                 registered_responder: register_key.clone(),
                 resource: path.clone(),
                 token: token.into(),
                 unacknowledge_message: None,
+                preferred_block_size,
             });
+
         resource
             .register_resources
             .replace(register_resource_key.clone());
@@ -367,16 +448,16 @@ impl Observer {
             Entry::Occupied(resource) => {
                 let r = resource.into_mut();
                 r.sequence += 1;
-                r.payload = payload.clone();
-                return r;
+                r.payload = Arc::new(payload.clone());
+                r.etag = Self::compute_etag(payload);
+                r
             }
-            Entry::Vacant(v) => {
-                return v.insert(ResourceItem {
-                    payload: payload.clone(),
-                    register_resources: HashSet::new(),
-                    sequence: 0,
-                });
-            }
+            Entry::Vacant(v) => v.insert(ResourceItem {
+                payload: Arc::new(payload.clone()),
+                register_resources: HashSet::new(),
+                sequence: 0,
+                etag: Self::compute_etag(payload),
+            }),
         }
     }
 
@@ -448,6 +529,15 @@ impl Observer {
         self.unacknowledge_messages.remove(message_id);
     }
 
+    /// Notifies a specific registered observer about a resource change.
+    ///
+    /// Note on Architecture: The payload truncation and Block2 option injection for the
+    /// first block are handled directly within `Observer` rather than the generic
+    /// `intercept_response` in `server.rs`. This is a deliberate design choice to maintain
+    /// single-responsibility in a push-based context: asynchronous notifications bypass the
+    /// main server request/response loop and are sent directly via the `Responder`.
+    /// Centralizing the "first block generation" logic here avoids duplicating the truncation
+    /// code for both synchronous registrations and asynchronous notifications.
     async fn notify_register_with_newest_resource(&mut self, register_resource_key: &String) {
         let message_id = self.current_message_id;
 
@@ -463,7 +553,23 @@ impl Observer {
         message.set_token(register_resource.token.clone());
         message.set_observe_value(resource.sequence);
         message.header.message_id = message_id;
-        message.payload = resource.payload.clone();
+        message.add_option(CoapOption::ETag, resource.etag.clone());
+
+        let total_size = resource.payload.len();
+        message.add_option(CoapOption::Size2, encode_coap_uint(total_size));
+
+        if let Some(block_size) = register_resource.preferred_block_size {
+            if resource.payload.len() > block_size {
+                let block = BlockValue::new(0, true, block_size).expect("valid block size");
+                message.add_option_as::<BlockValue>(CoapOption::Block2, block);
+                message.payload = resource.payload[..block_size].to_vec();
+            } else {
+                message.payload = resource.payload.to_vec();
+            }
+        } else {
+            message.payload = resource.payload.to_vec();
+        }
+
         if let Ok(b) = message.to_bytes() {
             debug!("notify register with newest resource {:?}", &b);
             register_resource.registered_responder.respond(b).await;
@@ -487,6 +593,8 @@ mod test {
 
     use super::super::*;
     use super::*;
+    use async_trait::async_trait;
+    use coap_lite::CoapResponse;
     use std::io::ErrorKind;
     use tokio::sync::mpsc;
 
@@ -509,6 +617,10 @@ mod test {
             _ => {}
         };
         return req;
+    }
+
+    fn decode_uint(data: &[u8]) -> usize {
+        data.iter().fold(0, |acc, &b| (acc << 8) | b as usize)
     }
 
     #[tokio::test]
@@ -662,9 +774,10 @@ mod test {
         observer.resources.insert(
             path.to_string(),
             ResourceItem {
-                payload: vec![],
+                payload: Arc::new(vec![]),
                 register_resources: HashSet::new(),
                 sequence: 0,
+                etag: vec![],
             },
         );
 
@@ -734,5 +847,321 @@ mod test {
             result.is_err(),
             "Expected no notification after RST cancellation"
         );
+    }
+
+    use tokio::sync::Mutex;
+
+    struct MockResponder {
+        addr: SocketAddr,
+        last_sent: Arc<Mutex<Option<Vec<u8>>>>,
+    }
+
+    impl MockResponder {
+        fn new(addr: SocketAddr) -> Self {
+            Self {
+                addr,
+                last_sent: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        async fn get_last_sent(&self) -> Option<Vec<u8>> {
+            self.last_sent.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl Responder for MockResponder {
+        async fn respond(&self, bytes: Vec<u8>) {
+            *self.last_sent.lock().await = Some(bytes);
+        }
+        fn address(&self) -> SocketAddr {
+            self.addr
+        }
+    }
+
+    #[tokio::test]
+    async fn test_observer_block_size_boundaries_and_preferences() {
+        let mut observer = Observer::new();
+        let path = "test";
+        let addr1: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:5002".parse().unwrap();
+
+        // 1. Prepare a resource exactly equal to block_size (1024 bytes)
+        let payload_exact = vec![0xAA; 1024];
+        let mut put_req = CoapRequest::<SocketAddr>::new();
+        put_req.set_method(Method::Put);
+        put_req.set_path(path);
+        put_req.message.payload = payload_exact.clone();
+        put_req.source = Some(addr1);
+        observer
+            .request_handler(&mut put_req, Arc::new(MockResponder::new(addr1)))
+            .await;
+
+        // 2. Client 1 registers, expecting block size 1024
+        let mut reg_req1 = CoapRequest::<SocketAddr>::new();
+        reg_req1.set_method(Method::Get);
+        reg_req1.set_path(path);
+        reg_req1.set_observe_flag(ObserveOption::Register);
+        reg_req1.message.add_option_as::<BlockValue>(
+            CoapOption::Block2,
+            BlockValue::new(0, false, 1024).unwrap(),
+        );
+        reg_req1.source = Some(addr1);
+        reg_req1.response = Some(CoapResponse {
+            message: Packet::new(),
+        });
+
+        let responder1 = Arc::new(MockResponder::new(addr1));
+        observer
+            .request_handler(&mut reg_req1, responder1.clone())
+            .await;
+
+        let resp1_bytes = responder1.get_last_sent().await.unwrap();
+        let resp1_pkt = Packet::from_bytes(&resp1_bytes).unwrap();
+
+        assert_eq!(resp1_pkt.payload.len(), 1024);
+        assert!(
+            resp1_pkt.get_option(CoapOption::Block2).is_none(),
+            "Should not add Block2 if exactly equal"
+        );
+
+        // Size2 assertion for Client 1 registration
+        let size2_opt = resp1_pkt.get_first_option(CoapOption::Size2);
+        assert!(
+            size2_opt.is_some(),
+            "Size2 missing in register response (no block2)"
+        );
+        let size2_val = decode_uint(size2_opt.unwrap());
+        assert_eq!(size2_val, 1024, "Size2 value mismatch");
+
+        // 3. Prepare larger resource (1500 bytes)
+        let payload_large = vec![0xBB; 1500];
+        let mut put_req2 = CoapRequest::<SocketAddr>::new();
+        put_req2.set_method(Method::Put);
+        put_req2.set_path(path);
+        put_req2.message.payload = payload_large.clone();
+        put_req2.source = Some(addr1);
+        observer
+            .request_handler(&mut put_req2, Arc::new(MockResponder::new(addr1)))
+            .await;
+
+        // 4. Client 2 registers, expecting block size 512
+        let mut reg_req2 = CoapRequest::<SocketAddr>::new();
+        reg_req2.set_method(Method::Get);
+        reg_req2.set_path(path);
+        reg_req2.set_observe_flag(ObserveOption::Register);
+        reg_req2.message.add_option_as::<BlockValue>(
+            CoapOption::Block2,
+            BlockValue::new(0, false, 512).unwrap(),
+        );
+        reg_req2.message.set_token(vec![2]);
+        reg_req2.source = Some(addr2);
+        reg_req2.response = Some(CoapResponse {
+            message: Packet::new(),
+        });
+
+        let responder2 = Arc::new(MockResponder::new(addr2));
+        observer
+            .request_handler(&mut reg_req2, responder2.clone())
+            .await;
+
+        let resp2_bytes = responder2.get_last_sent().await.unwrap();
+        let resp2_pkt = Packet::from_bytes(&resp2_bytes).unwrap();
+
+        assert_eq!(resp2_pkt.payload.len(), 512);
+        let block2_opt = resp2_pkt
+            .get_first_option_as::<BlockValue>(CoapOption::Block2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(block2_opt.size(), 512);
+        assert!(block2_opt.more, "Should have more blocks");
+
+        // Size2 assertion for Client 2 registration
+        let size2_opt2 = resp2_pkt.get_first_option(CoapOption::Size2);
+        assert!(
+            size2_opt2.is_some(),
+            "Size2 missing in register response with block2"
+        );
+        let size2_val2 = decode_uint(size2_opt2.unwrap());
+        assert_eq!(
+            size2_val2, 1500,
+            "Size2 value mismatch in block2 registration"
+        );
+
+        // 5. Trigger a resource change (PUT) to cause notification to Client 1
+        let mut put_req3 = CoapRequest::<SocketAddr>::new();
+        put_req3.set_method(Method::Put);
+        put_req3.set_path(path);
+        put_req3.message.payload = vec![0xCC; 1500];
+        put_req3.source = Some(addr1);
+        observer
+            .request_handler(&mut put_req3, responder1.clone())
+            .await;
+
+        let resp1_notify_bytes = responder1.get_last_sent().await.unwrap();
+        let resp1_notify_pkt = Packet::from_bytes(&resp1_notify_bytes).unwrap();
+
+        assert_eq!(resp1_notify_pkt.payload.len(), 1024);
+        let notify_block2 = resp1_notify_pkt
+            .get_first_option_as::<BlockValue>(CoapOption::Block2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(notify_block2.size(), 1024);
+
+        // Size2 assertion for notification
+        let size2_opt_notify = resp1_notify_pkt.get_first_option(CoapOption::Size2);
+        assert!(size2_opt_notify.is_some(), "Size2 missing in notification");
+        let size2_val_notify = decode_uint(size2_opt_notify.unwrap());
+        assert_eq!(
+            size2_val_notify, 1500,
+            "Size2 value mismatch in notification"
+        );
+    }
+
+    #[test]
+    fn test_encode_coap_uint() {
+        assert_eq!(encode_coap_uint(0), vec![]);
+        assert_eq!(encode_coap_uint(1), vec![0x01]);
+        assert_eq!(encode_coap_uint(255), vec![0xFF]);
+        assert_eq!(encode_coap_uint(256), vec![0x01, 0x00]);
+        assert_eq!(encode_coap_uint(0xFFFFFFFF), vec![0xFF, 0xFF, 0xFF, 0xFF]);
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(encode_coap_uint(0x100000000), vec![0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_observe_empty_resource_includes_size2() {
+        let mut observer = Observer::new();
+        let path = "empty";
+        let addr: SocketAddr = "127.0.0.1:5003".parse().unwrap();
+
+        // Create an empty resource via PUT
+        let empty_payload = vec![];
+        let mut put_req = CoapRequest::<SocketAddr>::new();
+        put_req.set_method(Method::Put);
+        put_req.set_path(path);
+        put_req.message.payload = empty_payload.clone();
+        put_req.source = Some(addr);
+        observer
+            .request_handler(&mut put_req, Arc::new(MockResponder::new(addr)))
+            .await;
+
+        // Register to observe the empty resource
+        let mut reg_req = CoapRequest::<SocketAddr>::new();
+        reg_req.set_method(Method::Get);
+        reg_req.set_path(path);
+        reg_req.set_observe_flag(ObserveOption::Register);
+        reg_req.source = Some(addr);
+        reg_req.response = Some(CoapResponse {
+            message: Packet::new(),
+        });
+        let responder = Arc::new(MockResponder::new(addr));
+        observer
+            .request_handler(&mut reg_req, responder.clone())
+            .await;
+
+        let resp_bytes = responder.get_last_sent().await.unwrap();
+        let resp_pkt = Packet::from_bytes(&resp_bytes).unwrap();
+
+        // Verify Size2 option is present and value is 0
+        let size2_opt = resp_pkt.get_first_option(CoapOption::Size2);
+        assert!(
+            size2_opt.is_some(),
+            "Size2 option missing for empty resource"
+        );
+        let size2_val = decode_uint(size2_opt.unwrap());
+        assert_eq!(size2_val, 0, "Size2 value should be 0 for empty payload");
+    }
+
+    #[tokio::test]
+    async fn test_observe_reregistration_updates_token_and_block_size() {
+        let mut observer = Observer::new();
+        let path = "test_update";
+        let addr: SocketAddr = "127.0.0.1:6001".parse().unwrap();
+
+        // Create a resource larger than block sizes to trigger block-wise transfer
+        let payload = vec![0xAA; 1500];
+        let mut put_req = CoapRequest::<SocketAddr>::new();
+        put_req.set_method(Method::Put);
+        put_req.set_path(path);
+        put_req.message.payload = payload.clone();
+        put_req.source = Some(addr);
+        observer
+            .request_handler(&mut put_req, Arc::new(MockResponder::new(addr)))
+            .await;
+
+        // Initial registration with Token A and Block2 preference 1024
+        let mut reg_req1 = CoapRequest::<SocketAddr>::new();
+        reg_req1.set_method(Method::Get);
+        reg_req1.set_path(path);
+        reg_req1.set_observe_flag(ObserveOption::Register);
+        reg_req1.message.set_token(vec![1]); // Token A
+        reg_req1.message.add_option_as::<BlockValue>(
+            CoapOption::Block2,
+            BlockValue::new(0, false, 1024).unwrap(),
+        );
+        reg_req1.source = Some(addr);
+        reg_req1.response = Some(CoapResponse {
+            message: Packet::new(),
+        });
+
+        let responder1 = Arc::new(MockResponder::new(addr));
+        observer
+            .request_handler(&mut reg_req1, responder1.clone())
+            .await;
+
+        // Re-registration from the same client with Token B and Block2 preference 512
+        let mut reg_req2 = CoapRequest::<SocketAddr>::new();
+        reg_req2.set_method(Method::Get);
+        reg_req2.set_path(path);
+        reg_req2.set_observe_flag(ObserveOption::Register);
+        reg_req2.message.set_token(vec![2]); // Token B
+        reg_req2.message.add_option_as::<BlockValue>(
+            CoapOption::Block2,
+            BlockValue::new(0, false, 512).unwrap(), // New preference
+        );
+        reg_req2.source = Some(addr);
+        reg_req2.response = Some(CoapResponse {
+            message: Packet::new(),
+        });
+
+        let responder2 = Arc::new(MockResponder::new(addr));
+        observer
+            .request_handler(&mut reg_req2, responder2.clone())
+            .await;
+
+        // Trigger a resource change to force a notification
+        let mut put_req2 = CoapRequest::<SocketAddr>::new();
+        put_req2.set_method(Method::Put);
+        put_req2.set_path(path);
+        put_req2.message.payload = vec![0xBB; 1500];
+        put_req2.source = Some(addr);
+        observer
+            .request_handler(&mut put_req2, responder2.clone())
+            .await;
+
+        // Fetch the notification sent by the observer
+        let resp_bytes = responder2.get_last_sent().await.unwrap();
+        let resp_pkt = Packet::from_bytes(&resp_bytes).unwrap();
+
+        // Verify the server used the updated state (Token B and Block size 512)
+        assert_eq!(
+            resp_pkt.get_token(),
+            vec![2],
+            "Server should use the updated token from re-registration"
+        );
+        assert_eq!(
+            resp_pkt.payload.len(),
+            512,
+            "Server should use the updated block size preference from re-registration"
+        );
+
+        let block2_opt = resp_pkt
+            .get_first_option_as::<BlockValue>(CoapOption::Block2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(block2_opt.size(), 512);
     }
 }

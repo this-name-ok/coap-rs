@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use coap_lite::{BlockHandler, BlockHandlerConfig, CoapRequest, CoapResponse, Packet};
+use coap_lite::{BlockHandler, BlockHandlerConfig, CoapOption, CoapRequest, CoapResponse, Packet};
 use log::debug;
 use std::{
     future::Future,
@@ -18,7 +18,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::observer::Observer;
+use crate::observer::{encode_coap_uint, Observer};
 
 #[derive(Debug)]
 pub enum CoAPServerError {
@@ -331,13 +331,37 @@ impl ServerCoapState {
     }
 
     pub async fn intercept_response(&mut self, request: &mut CoapRequest<SocketAddr>) {
-        match self.block_handler.intercept_response(request) {
-            Err(err) => {
-                let _ = request.apply_from_error(err);
+        let resource_path = request.get_path();
+
+        let is_block_fetch_for_observer = request.message.get_option(CoapOption::Block2).is_some()
+            && request.message.get_option(CoapOption::Observe).is_none()
+            && request.source.is_some()
+            && self
+                .observer
+                .is_observing(&request.source.unwrap(), &resource_path);
+
+        if is_block_fetch_for_observer {
+            if let Some((payload, etag)) =
+                self.observer.get_resource_payload_and_etag(&resource_path)
+            {
+                if let Some(ref mut response) = request.response {
+                    response.message.payload = payload.to_vec();
+                    response.message.clear_option(CoapOption::ETag);
+                    response.message.add_option(CoapOption::ETag, etag);
+                    // Prevent duplicate Size2 options, clear first.
+                    response.message.clear_option(CoapOption::Size2);
+                    response
+                        .message
+                        .add_option(CoapOption::Size2, encode_coap_uint(payload.len()));
+                }
             }
-            _ => {}
+        }
+
+        if let Err(err) = self.block_handler.intercept_response(request) {
+            let _ = request.apply_from_error(err);
         }
     }
+
     pub fn new() -> Self {
         Self {
             observer: Observer::new(),
